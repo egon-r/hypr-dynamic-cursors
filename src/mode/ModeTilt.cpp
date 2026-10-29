@@ -2,8 +2,10 @@
 #include "utils.hpp"
 #include "../config/ConfigManager.hpp"
 
-#include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+
+#include <algorithm>
+#include <chrono>
 #include <numbers>
 
 EModeUpdate CModeTilt::strategy() {
@@ -32,10 +34,27 @@ SModeResult CModeTilt::update(Vector2D pos) {
 
     auto result     = SModeResult();
     result.rotation = activation(function, limit, speed) * (std::numbers::pi / (180.0 / full_tilt));
+
+    const auto                          NOW = std::chrono::steady_clock::now();
+    const std::chrono::duration<double> DT  = NOW - lastTick;
+    lastTick                                = NOW;
+
+    const double INERTIA = std::clamp((double)CONFIG(tiltInertia), 0.0, SPRING_MASS_MAX);
+    if (INERTIA > 0) {
+        // approach the target angle through the damped spring
+        spring.setMass(INERTIA);
+        result.rotation = spring.update(result.rotation, DT.count());
+    } else {
+        // instantaneous tilt; keep the spring in sync so enabling inertia later starts seamlessly
+        spring.snap(result.rotation);
+    }
+
     return result;
 }
 
 void CModeTilt::warp(Vector2D old, Vector2D pos) {
+    // shifting all samples keeps the derived speed (and with it the spring target)
+    // unchanged, so a warp introduces no impulse into the spring
     auto delta = pos - old;
 
     for (auto& sample : samples)
@@ -45,4 +64,6 @@ void CModeTilt::warp(Vector2D old, Vector2D pos) {
 void CModeTilt::reset() {
     samples.clear();
     samples_index = 0;
+    spring.reset();
+    lastTick = std::chrono::steady_clock::now();
 }

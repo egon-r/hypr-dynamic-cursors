@@ -13,12 +13,13 @@
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
-#include <hyprland/src/protocols/core/Seat.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 #include <hyprland/src/helpers/math/Math.hpp>
+#include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprlang.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <cmath>
+#include <algorithm>
 #include <cstdlib>
 #include <climits>
 #include <gbm.h>
@@ -30,28 +31,70 @@
 #include "mode/Mode.hpp"
 #include "render/CursorPassElement.hpp"
 
+static constexpr double MIN_TRAIL_DISPLACEMENT = 0.5; // logical px below which no blur is worth rendering
+
+/*
+The union of two boxes, mirroring the native MotionBlur::extents.
+*/
+static CBox boxUnion(const CBox& a, const CBox& b) {
+    const double x1 = std::min(a.x, b.x);
+    const double y1 = std::min(a.y, b.y);
+    const double x2 = std::max(a.x + a.w, b.x + b.w);
+    const double y2 = std::max(a.y + a.h, b.y + b.h);
+
+    return {x1, y1, x2 - x1, y2 - y1};
+}
+
+/*
+The padded box the cursor sprite can occupy when drawn at `pos`, mirroring the
+damage padding of damageSoftware: generous enough for any hotspot, rotation and stretch.
+*/
+static CBox paddedCursorBox(Pointer::CPointerManager* pointers, double zoom, const Vector2D& pos) {
+    Vector2D size     = pointers->m_currentCursorImage.size / pointers->m_currentCursorImage.scale * zoom;
+    int      diagonal = size.size();
+    Vector2D padding  = {diagonal, diagonal};
+
+    return CBox{pos, size + (padding * 2)}.translate(-(pointers->m_currentCursorImage.hotspot * zoom + padding));
+}
+
 void tickRaw(SP<CEventLoopTimer> self, void* data) {
     if (g_pConfigHandler->isEnabled())
         g_pDynamicCursors->onTick(Pointer::mgr().get());
+    else if (g_pDynamicCursors)
+        // release locks and transient state which the enabled-only paths can no longer reach
+        g_pDynamicCursors->onDisabledTick(Pointer::mgr().get());
 
     const int TIMEOUT = g_pHyprRenderer->m_mostHzMonitor && g_pHyprRenderer->m_mostHzMonitor->m_refreshRate > 0 ? 1000.0 / g_pHyprRenderer->m_mostHzMonitor->m_refreshRate : 16;
     self->updateTimeout(std::chrono::milliseconds(TIMEOUT));
 }
-
 CDynamicCursors::CDynamicCursors() {
     this->tick = SP<CEventLoopTimer>(new CEventLoopTimer(std::chrono::microseconds(500), tickRaw, nullptr));
     g_pEventLoopManager->addTimer(this->tick);
+
+    // hide/show transitions can bypass the shape hooks (e.g. resetCursorImage);
+    // drop the blur history synchronously when the cursor becomes invisible so it
+    // can never smear across a visibility change
+    static const auto LISTENER = Pointer::mgr()->m_events.cursorChanged.listen([this]() -> void {
+        if (g_pDynamicCursors.get() == this && (!Pointer::mgr()->hasCursor() || !Pointer::mgr()->getCurrentCursorTexture()))
+            this->resetTrail(Pointer::mgr().get());
+    });
 }
 
 CDynamicCursors::~CDynamicCursors() {
-    // stop and deallocate timer
     g_pEventLoopManager->removeTimer(this->tick);
     this->tick.reset();
 
-    // release software lock
-    if (zoomSoftware) {
-        Pointer::mgr()->unlockSoftwareAll();
-        zoomSoftware = false;
+    // release software lock, damaging the last frame so nothing stale persists;
+    // release only the monitors we own, never counts other lockers hold
+    if (softwareLockHeld) {
+        this->damageSoftware(Pointer::mgr().get());
+
+        for (auto& m : lockedMonitors) {
+            if (!m.expired())
+                Pointer::mgr()->unlockSoftwareForMonitor(m.lock());
+        }
+        lockedMonitors.clear();
+        softwareLockHeld = false;
     }
 }
 
@@ -123,24 +166,69 @@ void CDynamicCursors::renderSoftware(Pointer::CPointerManager* pointers, PHLMONI
     box.w *= zoom;
     box.h *= zoom;
 
-    if (box.intersection(CBox{{}, {pMonitor->m_size}}).empty())
-        return;
-
-    box.scale(pMonitor->m_scale);
-    box.x = std::round(box.x);
-    box.y = std::round(box.y);
-
-    // we rotate the cursor by our calculated amount
-    box.rot = resultShown.rotation;
+    // genuine motion blur: hand the recent movement to the renderer, which averages
+    // the sprite along it instead of drawing the sharp cursor
+    std::optional<Vector2D> displacement;
+    if (CONFIG(motionBlurEnabled) && !overridePos.has_value())
+        displacement = trail.displacement(now, blurWindow(pMonitor->m_refreshRate));
 
     CCursorPassElement::SRenderData data;
-    data.tex = texture;
-    data.box = box;
-
+    data.tex              = texture;
     data.hotspot          = pointers->m_currentCursorImage.hotspot * state->monitor->m_scale * zoom;
     data.nearest          = nearest;
     data.stretchAngle     = resultShown.stretch.angle;
     data.stretchMagnitude = resultShown.stretch.magnitude;
+
+    // the sharp path culls pre-scale exactly like stock hyprland; the blur path scales
+    // first to build the exact swept quad in framebuffer space
+    const bool BLUR = displacement && displacement->size() > MIN_TRAIL_DISPLACEMENT;
+
+    if (BLUR) {
+        box.scale(pMonitor->m_scale);
+        box.x   = std::round(box.x);
+        box.y   = std::round(box.y);
+        box.rot = resultShown.rotation;
+
+        // exact swept extents of the transformed sprite (rotation, stretch, hotspot
+        // and displacement included), in framebuffer pixels of this monitor
+        const auto GEOMETRY = blurGeometry(box, resultShown.rotation, pointers->m_currentCursorImage.hotspot * pMonitor->m_scale * zoom, resultShown.stretch.angle,
+                                           resultShown.stretch.magnitude, *displacement * pMonitor->m_scale);
+
+        if (GEOMETRY.quad.intersection(CBox{{}, pMonitor->m_size * pMonitor->m_scale}).empty())
+            return;
+
+        // remember where this monitor's exposure is drawn (global logical extents) so
+        // it can be damaged when movement stops; the hooked damageSoftware already
+        // covers the previous exposure, so replacing the entry needs no extra damage.
+        // framebuffer -> logical first, then translate by the logical monitor position,
+        // rounded outwards so the damage can never clip the trail
+        auto         TRAIL = GEOMETRY.quad.copy().scale(1.F / pMonitor->m_scale).translate(pMonitor->m_position);
+        const double right = std::ceil(TRAIL.x + TRAIL.w), bottom = std::ceil(TRAIL.y + TRAIL.h);
+        TRAIL.x = std::floor(TRAIL.x);
+        TRAIL.y = std::floor(TRAIL.y);
+        TRAIL.w = right - TRAIL.x;
+        TRAIL.h = bottom - TRAIL.y;
+
+        auto it = std::ranges::find_if(lastTrailExposures, [&pMonitor](const auto& e) { return e.monitor.lock() == pMonitor; });
+        if (it != lastTrailExposures.end())
+            it->box = TRAIL;
+        else
+            lastTrailExposures.push_back({pMonitor, TRAIL});
+
+        trailRendered         = true;
+        data.blurDisplacement = *displacement * pMonitor->m_scale;
+        data.blurSamples      = static_cast<int>(std::clamp<long>(CONFIG(motionBlurSamples), 1, 64));
+    } else {
+        if (box.intersection(CBox{{}, {pMonitor->m_size}}).empty())
+            return;
+
+        box.scale(pMonitor->m_scale);
+        box.x   = std::round(box.x);
+        box.y   = std::round(box.y);
+        box.rot = resultShown.rotation;
+    }
+
+    data.box = box;
 
     g_pHyprRenderer->m_renderPass.add(makeUnique<CCursorPassElement>(data));
 
@@ -155,22 +243,23 @@ It is largely identical to hyprlands implementation, but expands the damage regi
 void CDynamicCursors::damageSoftware(Pointer::CPointerManager* pointers) {
 
     // we damage a padding of the diagonal around the hotspot, to accommodate for all possible hotspots and rotations
-    auto     zoom     = resultShown.scale;
-    Vector2D size     = pointers->m_currentCursorImage.size / pointers->m_currentCursorImage.scale * zoom;
-    int      diagonal = size.size();
-    Vector2D padding  = {diagonal, diagonal};
+    auto zoom = resultShown.scale;
+    CBox b    = paddedCursorBox(pointers, zoom, pointers->m_pointerPos);
 
-    CBox b = CBox{pointers->m_pointerPos, size + (padding * 2)}.translate(-(pointers->m_currentCursorImage.hotspot * zoom + padding));
+    // cover the blur trails of previous frames, so no ghost of them persists
+    if (lastTrailAny())
+        b = boxUnion(b, lastTrailUnion());
 
     static auto PNOHW = CConfigValue<Hyprlang::INT>("cursor:no_hardware_cursors");
 
+    // damage every monitor the cursor or its trail overlaps individually: one
+    // monitor's frame-skip policy must not suppress damage on the other outputs
     for (auto& mw : pointers->m_monitorStates) {
         if (mw->monitor.expired())
             continue;
 
         if ((mw->softwareLocks > 0 || mw->hardwareFailed || *PNOHW) && b.overlaps({mw->monitor->m_position, mw->monitor->m_size})) {
-            g_pHyprRenderer->damageBox(b, mw->monitor->shouldSkipScheduleFrameOnMouseEvent());
-            break;
+            mw->monitor->addDamage(b.copy().translate(-mw->monitor->m_position).scale(mw->monitor->m_scale).round());
         }
     }
 }
@@ -319,8 +408,17 @@ bool CDynamicCursors::setHardware(Pointer::CPointerManager* pointers, SP<Pointer
 Handles cursor move events.
 */
 void CDynamicCursors::onCursorMoved(Pointer::CPointerManager* pointers) {
-    if (!pointers->hasCursor())
+    if (!pointers->hasCursor()) {
+        // do not let a move event of a hidden cursor classify the next warp as genuine
+        isMove = false;
         return;
+    }
+
+    // warps must not smear across the screen, genuine moves feed the trail
+    if (isMove)
+        trail.record(pointers->m_pointerPos, Time::steadyNow());
+    else
+        resetTrail(pointers);
 
     const auto CURSORBOX = pointers->getCursorBoxGlobal();
     bool       recalc    = false;
@@ -375,6 +473,12 @@ void CDynamicCursors::onCursorMoved(Pointer::CPointerManager* pointers) {
 }
 
 void CDynamicCursors::setShape(const std::string& shape) {
+    // a shape change changes the sprite; never blur between two shapes
+    if (shape != lastShape) {
+        resetTrail(Pointer::mgr().get());
+        lastShape = shape;
+    }
+
     g_pConfigHandler->m_shapeRules->activate(shape);
     highres.loadShape(shape);
 }
@@ -384,6 +488,8 @@ void CDynamicCursors::unsetShape() {
 }
 
 void CDynamicCursors::updateTheme() {
+    // the theme reload replaces all textures; drop any trail of the old ones
+    resetTrail(Pointer::mgr().get());
     highres.update();
 }
 
@@ -391,6 +497,7 @@ void CDynamicCursors::updateTheme() {
 Handle cursor tick events.
 */
 void CDynamicCursors::onTick(Pointer::CPointerManager* pointers) {
+    updateBlur(pointers);
     calculate(TICK);
 }
 
@@ -437,22 +544,6 @@ void CDynamicCursors::calculate(EModeUpdate type) {
         resultShown = result;
         resultShown.clamp(CONFIG(threshold) * (std::numbers::pi / 180.0), 0.01, 0.01); // clamp low values so it is rendered pixel-perfectly when no effect
 
-        // lock software cursors if zooming
-        if (resultShown.scale > 1) {
-            if (!zoomSoftware) {
-                Pointer::mgr()->lockSoftwareAll();
-                zoomSoftware = true;
-            }
-        } else {
-            if (zoomSoftware) {
-                // damage so it is cleared properly
-                Pointer::mgr()->damageIfSoftware();
-
-                Pointer::mgr()->unlockSoftwareAll();
-                zoomSoftware = false;
-            }
-        }
-
         // damage software and change hardware cursor shape
         Pointer::mgr()->damageIfSoftware();
 
@@ -477,6 +568,194 @@ void CDynamicCursors::calculate(EModeUpdate type) {
             Pointer::mgr()->updateCursorBackend();
         }
     }
+
+    // lock software cursors if zooming; re-evaluated on every calculate, so a zoom
+    // desire surviving a plugin disable/enable cycle re-asserts its software lock
+    const bool ZOOM = resultShown.scale > 1;
+    if (ZOOM != zoomSoftware) {
+        zoomSoftware = ZOOM;
+        updateSoftwareLock(Pointer::mgr().get());
+    }
+}
+/*
+(De)engage the single software cursor lock shared by zoom and motion blur.
+*/
+void CDynamicCursors::updateSoftwareLock(Pointer::CPointerManager* pointers) {
+    const bool WANT = zoomSoftware || blurSoftware;
+
+    if (!WANT) {
+        if (softwareLockHeld) {
+            // damage so the last software frame is cleared properly
+            this->damageSoftware(pointers);
+
+            // release only the locks we own
+            for (auto& m : lockedMonitors) {
+                if (!m.expired())
+                    pointers->unlockSoftwareForMonitor(m.lock());
+            }
+            lockedMonitors.clear();
+            softwareLockHeld = false;
+        }
+        return;
+    }
+
+    if (!softwareLockHeld) {
+        pointers->lockSoftwareAll();
+        softwareLockHeld = true;
+
+        lockedMonitors.clear();
+        for (auto& mw : pointers->m_monitorStates) {
+            if (!mw->monitor.expired())
+                lockedMonitors.push_back(mw->monitor);
+        }
+        return;
+    }
+
+    // reconcile: lock monitors that appeared while the lock was held. ownership is
+    // checked, not the aggregate count: a new monitor already locked by someone else
+    // must still become ours, or blur loses it when that other locker releases
+    for (auto& mw : pointers->m_monitorStates) {
+        if (mw->monitor.expired())
+            continue;
+
+        const bool OWNED = std::ranges::any_of(lockedMonitors, [&mw](const auto& m) { return m.lock() == mw->monitor.lock(); });
+        if (OWNED)
+            continue;
+
+        pointers->lockSoftwareForMonitor(mw->monitor.lock());
+        lockedMonitors.push_back(mw->monitor);
+    }
+}
+
+/*
+Blur housekeeping on tick: follow config changes, reconcile the software lock,
+expire the rendered trail once movement has stopped, and never carry history
+across a visibility change.
+*/
+void CDynamicCursors::updateBlur(Pointer::CPointerManager* pointers) {
+    const bool WANT = CONFIG(motionBlurEnabled);
+    if (WANT != blurSoftware) {
+        blurSoftware = WANT;
+        if (!WANT)
+            resetTrail(pointers);
+    }
+
+    // reconcile every tick: also covers monitors hotplugged while the lock is held
+    // and runs even while hidden, so disabling never strands the lock
+    updateSoftwareLock(pointers);
+
+    // a hidden or texture-less cursor must not keep (or record) history, so it can
+    // never smear across a hide/show transition
+    if (!pointers->hasCursor() || !pointers->getCurrentCursorTexture()) {
+        if (lastTrailAny() || trailRendered)
+            resetTrail(pointers);
+        else
+            trail.reset();
+        return;
+    }
+
+    // keep the history rolling so the displacement decays after movement stops
+    trail.record(pointers->m_pointerPos, Time::steadyNow());
+
+    // the cursor stopped moving: expire the rendered trail with one final damage.
+    // conservative: only expire once even the slowest monitor still rendering the
+    // cursor has decayed, so faster monitors never cut a slower one's exposure short
+    if (trailRendered) {
+        float slowestHz = 0;
+        for (auto& mw : pointers->m_monitorStates) {
+            if (mw->monitor.expired() || !(mw->softwareLocks > 0 || mw->hardwareFailed))
+                continue;
+
+            const auto HZ = mw->monitor.lock()->m_refreshRate;
+            if (HZ > 0 && (slowestHz == 0.F || HZ < slowestHz))
+                slowestHz = HZ;
+        }
+
+        const auto DISPLACEMENT = trail.displacement(Time::steadyNow(), blurWindow(slowestHz));
+        if (!DISPLACEMENT || DISPLACEMENT->size() <= MIN_TRAIL_DISPLACEMENT) {
+            // trail fully decayed: one last damage renders the sharp cursor
+            pointers->damageIfSoftware(); // hooked, so the trail areas are covered
+            resetTrailState();
+        } else
+            // still decaying: schedule redraws so the trail shrinks smoothly instead
+            // of staying frozen until the final expiry. the per-monitor exposure
+            // footprints keep the damaged area bounded
+            pointers->damageIfSoftware();
+    }
+}
+
+/*
+Clear exposure bookkeeping without damaging.
+*/
+void CDynamicCursors::resetTrailState() {
+    lastTrailExposures.clear();
+    trailRendered = false;
+    trail.reset();
+}
+
+/*
+Reset the blur history, damaging the rendered trail first so no ghost remains.
+Only usable while the plugin is enabled, as it relies on the damage hook.
+*/
+void CDynamicCursors::resetTrail(Pointer::CPointerManager* pointers) {
+    if (lastTrailAny()) {
+        pointers->damageIfSoftware();
+        lastTrailExposures.clear();
+    }
+    trailRendered = false;
+    trail.reset();
+}
+
+/*
+The union of all live per-monitor exposures.
+*/
+CBox CDynamicCursors::lastTrailUnion() const {
+    CBox out{};
+    bool any = false;
+
+    for (const auto& e : lastTrailExposures) {
+        if (e.monitor.expired())
+            continue;
+
+        out = any ? boxUnion(out, e.box) : e.box;
+        any = true;
+    }
+
+    return out;
+}
+
+/*
+The time window of movement the blur exposes on a monitor running at `refreshHz`:
+`strength` refresh intervals, clamped to what the bounded history retains.
+*/
+std::chrono::milliseconds CDynamicCursors::blurWindow(float refreshHz) {
+    const float STRENGTH = std::clamp(CONFIG(motionBlurStrength), 1.0F, 16.0F);
+    const float HZ       = refreshHz > 0 ? refreshHz : 60.F;
+    return std::chrono::milliseconds{std::clamp(static_cast<long>(STRENGTH * (1000.F / HZ)), 8L, 250L)};
+}
+
+/*
+Runs on every tick while the plugin is disabled: releases locks and transient
+state which the enabled-only code paths can no longer reach.
+*/
+void CDynamicCursors::onDisabledTick(Pointer::CPointerManager* pointers) {
+    zoomSoftware = false;
+    blurSoftware = false;
+
+    if (softwareLockHeld) {
+        // our own damageSoftware covers the trail area, the stock damage hook would not
+        this->damageSoftware(pointers);
+
+        // release only the locks we own; monitors hotplugged while disabled were never locked
+        for (auto& m : lockedMonitors) {
+            if (!m.expired())
+                pointers->unlockSoftwareForMonitor(m.lock());
+        }
+        lockedMonitors.clear();
+        softwareLockHeld = false;
+    }
+
+    resetTrailState();
 }
 
 void CDynamicCursors::setMove() {

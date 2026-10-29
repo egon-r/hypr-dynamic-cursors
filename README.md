@@ -1,4 +1,7 @@
 # hypr-dynamic-cursors
+
+> Personal, unofficial derivative of [VirtCode/hypr-dynamic-cursors](https://github.com/VirtCode/hypr-dynamic-cursors), maintained at [egon-r/hypr-dynamic-cursors](https://github.com/egon-r/hypr-dynamic-cursors). Upstream history, attribution, and MIT license are retained. The additions here are GPU cursor motion blur and optional spring-based tilt inertia. Build against matching Hyprland headers; this branch targets Hyprland 0.56.2. Upstream installation instructions below describe the original plugin, not these patches.
+
 This plugin makes your cursor more realistic by simulating how it would behave if it was an actual object being dragged across your screen. This means that your cursor can change based on how it is used, e.g. tilt in the direction you are moving or straight out rotate towards it.
 
 Why did I implement this again?
@@ -17,6 +20,20 @@ In this mode, the cursor is tilted based on the `x` direction and speed it is mo
 
 https://github.com/VirtCode/hypr-dynamic-cursors/assets/41426325/ae25415c-e77f-4c85-864c-2eedbfe432e3
 
+This derivative adds `tilt.inertia`: `0` (default) keeps the original immediate response; positive values enable a damped angular spring with a small swing past neutral after movement stops or reverses. `1` is reference mass, `2` doubles that mass, and the maximum is `10`. Doubling mass slows the response by approximately √2, not 2×. Only the sprite rotates about its hotspot: pointer position and click accuracy are unchanged.
+
+Example heavier profile, keeping cursor blur independent:
+
+```lua
+hl.config({ plugin = { dynamic_cursors = {
+    mode = "tilt",
+    threshold = 1,
+    tilt = { inertia = 2.0 },
+    shake = { enabled = false },
+    motion_blur = { enabled = true, samples = 8, strength = 2.0 },
+} } })
+```
+
 #### `stretch`
 This mode tries recreating the stretching and squishing that is done to moving object in comic animations. It stretches your cursor in the direction you are moving based on the speed. Yes, this is not at all realistic.
 
@@ -25,7 +42,31 @@ https://github.com/VirtCode/hypr-dynamic-cursors/assets/41426325/7b8289e7-9dd2-4
 ### shake to find
 The plugin supports shake to find, akin to how KDE Plasma, MacOS, etc. do it. It can also be extensively configured and is enabled by default. It also supports using [hyprcursor](https://github.com/hyprwm/hyprcursor) for high resolution cursor images. The magnification can also be triggered as a dispatcher instead of on shake. If you only want shake to find, and no weird cursor behaviour, you can disable the above modes with the mode `none`.
 
-https://github.com/user-attachments/assets/1346101e-4e62-4ba2-a1df-5940e0706514
+
+### cursor motion blur
+The plugin can apply a genuine motion blur to your cursor, akin to the window motion blur of Hyprland itself. While the cursor is moving, its sprite is averaged along its recent movement, leaving a smear trailing behind the direction of travel. Once movement stops, the trail shrinks back to a perfectly sharp cursor within the configured exposure, and it never persists across stops, warps, shape changes or the cursor being hidden. It works independently of the simulation modes and shake to find, and combines with both.
+
+```lua
+hl.config { plugin = { dynamic_cursors = {
+    mode = "none",
+    shake = { enabled = false },
+    motion_blur = {
+        enabled = true,
+        samples = 8,
+        strength = 2.0,
+    },
+}}}
+```
+
+> **Note:**
+> Motion blur renders through the GPU shader path of the software cursor, so while it is enabled the plugin holds its own software cursor lock (the same mechanism shake magnification uses); your `cursor:no_hardware_cursors` setting is not modified. The trail is drawn with the cursor's current transform, and its displacement is measured over a fixed time window, so comparable linear movement produces a comparable blur regardless of the report rate of your pointing device.
+
+`samples` controls smoothness (1–64); `strength` controls the exposure in monitor refresh intervals (1–16, capped at 250 ms). They are independent: increasing samples does not lengthen the exposure. Both blur controls are independent of Hyprland's `decoration.motion_blur` window settings. Motion blur is disabled by default.
+
+The exposure also controls decay after stopping: `strength = 4` takes twice as long to clear as `2`, and covers twice the travel at constant speed (until the 250 ms cap). At 144 Hz these exposures are approximately 27 ms and 13 ms; at 100 Hz, 40 ms and 20 ms. It is a shrinking motion smear, not a separate afterimage fade.
+
+The transformed smear is generated in a cached cursor-local texture and composited through Hyprland's native texture pass, retaining its output color-management path.
+
 
 ## state
 This plugin is still very early in its development. There are also multiple things which may or may not be implemented in the future:
@@ -137,6 +178,33 @@ hl.plugin.load("/usr/lib/hyprland-plugins/dynamic-cursors.so")
 
 If you think your distro has good packages for dynamic-cursors but it is not listed here, MRs are welcome!
 
+### building and testing locally
+The plugin is a single shared library built against the installed Hyprland headers, no installation or live session required:
+```sh
+make        # builds out/dynamic-cursors.so
+```
+
+Load this derivative directly after building it with headers matching your running compositor (experimental plugin code runs inside Hyprland):
+
+```sh
+hyprctl plugin load "$PWD/out/dynamic-cursors.so"
+# Unload to roll back; this does not change configuration files:
+hyprctl plugin unload "$PWD/out/dynamic-cursors.so"
+```
+
+Do not rebuild a shared library while it is loaded; unload it first or build in a separate checkout. This derivative does not publish updated `hyprpm` compatibility pins; upstream pins can select an older commit without these features. Use the direct local build/load above for this branch.
+
+The cursor movement history and angular spring are plain C++ and can be tested without any compositor:
+```sh
+make test   # builds and runs movement-history and spring behavior tests
+```
+
+The blur code was built against Hyprland 0.56.2 headers. Off-session NVIDIA GLES smoke checks exercised the actual shader source: sample coverage/alpha, doubled displacement, rotated and stretched sprites, rotated output projection, and two-pass cached-texture orientation/transparent padding. The movement-history tests cover first movement, report-rate independence, idle expiry and reset.
+
+Live cursor blur was loaded into Hyprland 0.56.2 and the user confirmed the visual effect. This is not exhaustive compositor validation: monitor hotplug, HDR/ICC output, and external-image cursor sources remain untested. An earlier isolated nested test could not start because Aquamarine requested `xdg_wm_base` v6 while the installed Cage host exposed v5. For a manual session test, move then stop the pointer, warp it, hide/show it, change its shape, disable/re-enable blur and the plugin, then unload it; check that the cursor returns sharp and no old trail remains on either output.
+
+The first live inertia trial crashed Hyprland after an incremental rebuild. The build had mixed old consumers with the expanded `CModeTilt` class layout because it did not track header dependencies. The Makefile now generates and includes transitive compiler dependency files (`-MMD -MP`), and the library must be clean-built when upgrading from an older checkout. Inertia is covered by deterministic spring tests, but the corrected build has not been validated in a live compositor; do not treat it as session-safe yet.
+
 ## configuration
 
 <details>
@@ -206,6 +274,9 @@ plugin:dynamic-cursors {
 
         # full tilt for each side (°)
         full = 60
+
+        # angular spring mass (0 = original immediate tilt, 2 = double reference mass)
+        inertia = 0.0
     }
 
     # for mode = stretch
@@ -259,6 +330,22 @@ plugin:dynamic-cursors {
         # enable ipc events for shake
         # see the `ipc` section below
         ipc = false
+    }
+    # genuine cursor motion blur
+    # averages the cursor sprite along its recent movement, like the window
+    # motion blur. while enabled, this forces software cursor rendering
+    motion_blur {
+
+        # enables cursor motion blur
+        enabled = false
+
+        # number of sprite samples averaged along the movement path
+        # more samples are smoother, but cost more gpu time (1-64)
+        samples = 8
+
+        # trail length in refresh intervals of the monitor
+        # 1 means roughly one frame of movement, higher values smear further
+        strength = 2.0
     }
 
     # use hyprcursor to get a higher resolution texture when the cursor is magnified
@@ -380,6 +467,9 @@ hl.config { plugin = { dynamic_cursors = {
 
         -- full tilt for each side (°)
         full = 60,
+
+        -- angular spring mass (0 = original immediate tilt, 2 = double reference mass)
+        inertia = 0.0,
     },
 
     -- for mode = "stretch"
@@ -433,6 +523,22 @@ hl.config { plugin = { dynamic_cursors = {
         -- enable ipc events for shake
         -- see the `ipc` section below
         ipc = false,
+    },
+    -- genuine cursor motion blur
+    -- averages the cursor sprite along its recent movement, like the window
+    -- motion blur. while enabled, this forces software cursor rendering
+    motion_blur = {
+
+        -- enables cursor motion blur
+        enabled = false,
+
+        -- number of sprite samples averaged along the movement path
+        -- more samples are smoother, but cost more gpu time (1-64)
+        samples = 8,
+
+        -- trail length in refresh intervals of the monitor
+        -- 1 means roughly one frame of movement, higher values smear further
+        strength = 2.0,
     },
 
     -- use hyprcursor to get a higher resolution texture when the cursor is magnified

@@ -40,7 +40,11 @@ CConfigHandler::CConfigHandler() {
     c_shakeSpeed      = conf(NS("shake:speed"),            4.0f,                   "magnification increase per second when continuing to shake");
     c_shakeInfluence  = conf(NS("shake:influence"),        0.0f,                   "how much the speed is influenced by the current shake intensity");
     c_shakeLimit      = conf(NS("shake:limit"),            0.0f,                   "maximal magnification the cursor can reach");
-    c_shakeTimeout    = conf(NS("shake:timeout"),          2000,                   "time in milliseconds the cursor will stay magnified after a shake has ended");
+    c_shakeTimeout    = conf(NS("shake:timeout"),        2000,                   "time in milliseconds the cursor will stay magnified after a shake has ended");
+
+    c_motionBlurEnabled  = conf(NS("motion_blur:enabled"),  false, "enables genuine cursor motion blur (forces software cursors)");
+    c_motionBlurSamples  = conf(NS("motion_blur:samples"),  8,    "number of sprite samples averaged along the movement path (1-64)");
+    c_motionBlurStrength = conf(NS("motion_blur:strength"), 2.0f, "trail length in refresh intervals of the monitor (1-16)");
 
     c_highresEnabled  = conf(NS("hyprcursor:enabled"),     true,                   "enable dedicated hyprcursor support");
     c_highresNearest  = conf(NS("hyprcursor:nearest"),     1,                      "use nearest-neighbour scaling when magnifying beyond texture size");
@@ -51,6 +55,7 @@ CConfigHandler::CConfigHandler() {
     c_tiltLimit       = prop(NS("tilt:limit"),             5000,                   "controls at which speed the full tilt is reached");
     c_tiltWindow      = prop(NS("tilt:window"),            100,                    "time window over which the speed is calculated");
     c_tiltFull        = prop(NS("tilt:full"),              60,                     "full tilt for each side in degrees");
+    c_tiltInertia     = prop(NS("tilt:inertia"),           0.0f,                   "mass of the damped spring adding inertia to the tilt, 0 disables, useful range 0-10");
 
     c_stretchFunction = prop(NS("stretch:activation"),     "negative_quadratic",   "relationship between speed and stretch amount (linear, quadratic, negative_quadratic)", {{"linear", ACTIVATION_LINEAR}, {"quadratic", ACTIVATION_QUADRATIC}, {"negative_quadratic", ACTIVATION_NEGATIVE_QUADRATIC}});
     c_stretchLimit    = prop(NS("stretch:limit"),          3000,                   "controls at which speed the full stretch is reached");

@@ -13,7 +13,17 @@
 #include "mode/ModeStretch.hpp"
 #include "other/Shake.hpp"
 #include "highres.hpp"
+#include <vector>
+#include "other/Trail.hpp"
 
+/*
+The last blur exposure a single monitor still shows, so damage coverage stays
+bounded per monitor instead of growing with the movement history.
+*/
+struct SLastTrailExposure {
+    PHLMONITORREF monitor; // weak; entries of removed monitors are skipped
+    CBox          box;     // global logical extents of the last drawn exposure
+};
 class CDynamicCursors {
   public:
     CDynamicCursors();
@@ -25,8 +35,8 @@ class CDynamicCursors {
     void onTick(Pointer::CPointerManager* pointers);
 
     /* hook on renderSoftwareCursorsFor */
-    void renderSoftware(Pointer::CPointerManager* pointers, PHLMONITOR pMonitor, const Time::steady_tp& now, CRegion& damage, std::optional<Vector2D> overridePos,
-                        bool screencopy, bool forceRender);
+    void renderSoftware(Pointer::CPointerManager* pointers, PHLMONITOR pMonitor, const Time::steady_tp& now, CRegion& damage, std::optional<Vector2D> overridePos, bool screencopy,
+                        bool forceRender);
     /* hook on damageIfSoftware*/
     void damageSoftware(Pointer::CPointerManager* pointers);
     /* hook on renderHWCursorBuffer */
@@ -45,6 +55,8 @@ class CDynamicCursors {
     void setMove();
 
     void dispatchMagnify(std::optional<int> duration, std::optional<float> size);
+    /* called from tickRaw even while the plugin is disabled, to release state the enabled-only paths would leak */
+    void onDisabledTick(Pointer::CPointerManager* pointers);
 
   private:
     SP<CEventLoopTimer> tick;
@@ -61,6 +73,10 @@ class CDynamicCursors {
 
     // whether we have already locked software for cursor zoom
     bool zoomSoftware = false;
+    // whether motion blur wants the software lock held
+    bool blurSoftware = false;
+    // whether the combined zoom/blur software lock is currently held
+    bool softwareLockHeld = false;
 
     // modes
     CModeRotate  rotate;
@@ -76,6 +92,32 @@ class CDynamicCursors {
 
     /* is set true if a genuine move is being performed, and will be reset to false after onCursorMoved */
     bool isMove = false;
+
+    // cursor movement history for motion blur
+    CTrailTracker                   trail;
+    // per-monitor last drawn blur exposure, appended once per monitor
+    std::vector<SLastTrailExposure> lastTrailExposures;
+    // monitors this plugin holds a software lock on (reconciled on hotplug)
+    std::vector<PHLMONITORREF>      lockedMonitors;
+    bool                            trailRendered = false; // whether a blur trail may currently be visible anywhere
+    std::string                     lastShape;             // shape name dedup for blur resets
+
+    /* (de)engage the combined software cursor lock for zoom and blur */
+    void updateSoftwareLock(Pointer::CPointerManager* pointers);
+    /* blur housekeeping: config changes, trail expiry, cursor disappearance */
+    void updateBlur(Pointer::CPointerManager* pointers);
+    /* union of all live per-monitor exposures, invalid box when lastTrailAny() is false */
+    CBox lastTrailUnion() const;
+    /* whether any monitor still has a recorded exposure */
+    bool lastTrailAny() const {
+        return !lastTrailExposures.empty();
+    }
+    /* clear exposure bookkeeping without damaging */
+    void                             resetTrailState();
+    /* reset the blur history, damaging the rendered trail first so no ghost remains */
+    void                             resetTrail(Pointer::CPointerManager* pointers);
+    /* time window of movement the blur exposes, for a monitor running at `refreshHz` */
+    static std::chrono::milliseconds blurWindow(float refreshHz);
 
     // calculates the current angle of the cursor, and changes the cursor shape
     void calculate(EModeUpdate type);

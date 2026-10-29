@@ -15,6 +15,8 @@ class CCursorPassElement : public IPassElement {
         bool     nearest;
         double   stretchAngle;
         Vector2D stretchMagnitude;
+        Vector2D blurDisplacement = {};
+        int      blurSamples      = 1;
     };
 
     CCursorPassElement(const SRenderData& data);

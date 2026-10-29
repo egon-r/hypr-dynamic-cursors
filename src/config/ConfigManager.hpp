@@ -40,6 +40,10 @@ class CConfigHandler {
     SP<CFloatValue> c_shakeLimit;
     SP<CIntValue>   c_shakeTimeout;
 
+    SP<CBoolValue>  c_motionBlurEnabled;
+    SP<CIntValue>   c_motionBlurSamples;
+    SP<CFloatValue> c_motionBlurStrength;
+
     SP<CBoolValue>   c_highresEnabled;
     SP<CIntValue>    c_highresNearest;
     SP<CStringValue> c_highresFallback;
@@ -49,6 +53,7 @@ class CConfigHandler {
     SP<CIntProp>     c_tiltLimit;
     SP<CIntProp>     c_tiltWindow;
     SP<CIntProp>     c_tiltFull;
+    SP<CFloatProp>   c_tiltInertia;
 
     SP<CVariantProp> c_stretchFunction;
     SP<CIntProp>     c_stretchLimit;

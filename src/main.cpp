@@ -20,6 +20,7 @@
 #include <dlfcn.h>
 
 #include "globals.hpp"
+#include "render/renderer.hpp"
 #include "cursor.hpp"
 #include "config/ConfigManager.hpp"
 
@@ -248,9 +249,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
 APICALL EXPORT void PLUGIN_EXIT() {
 
+    // destroy the cursor state: stops the tick timer and releases software locks
+    g_pDynamicCursors.reset();
+
     // we need to remove our pass elements because otherwise we'll have some
     // invalid passes after unload, causing a SEGV
     g_pHyprRenderer->m_renderPass.removeAllOfType("CCursorPassElement");
+    // release the blur renderer gl resources
+    destroyCursorBlurRenderer();
 }
 
 // Do NOT change this function.
