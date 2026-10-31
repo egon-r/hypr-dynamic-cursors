@@ -46,6 +46,10 @@ The plugin supports shake to find, akin to how KDE Plasma, MacOS, etc. do it. It
 ### cursor motion blur
 The plugin can apply a genuine motion blur to your cursor, akin to the window motion blur of Hyprland itself. While the cursor is moving, its sprite is averaged along its recent movement, leaving a smear trailing behind the direction of travel. Once movement stops, the trail shrinks back to a perfectly sharp cursor within the configured exposure, and it never persists across stops, warps, shape changes or the cursor being hidden. It works independently of the simulation modes and shake to find, and combines with both.
 
+![Cursor motion blur demo: the cursor leaves a soft smear while moving and shrinks back to a sharp sprite when it stops](assets/cursor-motion-blur.webp)
+
+*Recorded with blur off, then on (`samples = 8`, `strength = 4`; animated WebP, 372 KiB). The example below uses `strength = 2.0`.*
+
 ```lua
 hl.config { plugin = { dynamic_cursors = {
     mode = "none",
