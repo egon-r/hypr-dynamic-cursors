@@ -26,7 +26,7 @@ SCursorBlurGeometry blurGeometry(const CBox& box, float rotation, const Vector2D
  *  dispatches a draw call using the current hyprland renderer to draw the cursor with the provided transform
  *  will modify the monitor transform and do a tex pass immediately
  */
-void drawCursor(const Mat3x3& transform, SP<Render::ITexture> tex, CBox box, CRegion damage, bool nearest);
+void drawCursor(Render::CRenderContext& ctx, const Mat3x3& transform, SP<Render::ITexture> tex, CBox box, CRegion damage, bool nearest);
 
 /*
  *  releases all GPU resources cached by the cursor motion blur renderer (program, VAO/VBO).

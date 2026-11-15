@@ -104,7 +104,7 @@ namespace {
         if (ok != GL_TRUE) {
             char log[1024];
             glGetShaderInfoLog(shader, 1024, nullptr, log);
-            Log::logger->log(Log::ERR, "[dynamic-cursors] failed to compile blur shader: {}", log);
+            LOG(Log::ERR, "[dynamic-cursors] failed to compile blur shader: {}", log);
             glDeleteShader(shader);
             return 0;
         }
@@ -125,12 +125,12 @@ namespace {
         out = FRAG_SRC;
 
         if (!out.starts_with(VERSION)) {
-            Log::logger->log(Log::ERR, "[dynamic-cursors] blur shader: unexpected #version line, cannot build external variant");
+            LOG(Log::ERR, "[dynamic-cursors] blur shader: unexpected #version line, cannot build external variant");
             return false;
         }
         const auto sampler = out.find(SAMPLER);
         if (sampler == std::string::npos) {
-            Log::logger->log(Log::ERR, "[dynamic-cursors] blur shader: sampler declaration not found, cannot build external variant");
+            LOG(Log::ERR, "[dynamic-cursors] blur shader: sampler declaration not found, cannot build external variant");
             return false;
         }
 
@@ -181,7 +181,7 @@ namespace {
         if (ok != GL_TRUE) {
             char log[1024];
             glGetProgramInfoLog(p.program, 1024, nullptr, log);
-            Log::logger->log(Log::ERR, "[dynamic-cursors] failed to link blur shader: {}", log);
+            LOG(Log::ERR, "[dynamic-cursors] failed to link blur shader: {}", log);
             glDeleteProgram(p.program);
             p.program = 0;
             p.failed  = true;
@@ -218,7 +218,7 @@ namespace {
     static bool                 sizeWarned = false;
 } // namespace
 
-bool drawCursorBlurred(const SCursorBlurDraw& draw) {
+bool drawCursorBlurred(Render::CRenderContext& ctx, const SCursorBlurDraw& draw) {
     // supported sources: plain RGBA/RGBX 2D textures and EXTERNAL (EGLImage) textures;
     // anything else keeps the native sharp cursor path.
     GLenum target   = GL_TEXTURE_2D;
@@ -236,7 +236,7 @@ bool drawCursorBlurred(const SCursorBlurDraw& draw) {
         default: return false;
     }
 
-    const auto& DAMAGE = g_pHyprRenderer->m_renderData.damage;
+    const auto& DAMAGE = ctx.m_data.damage;
     if (DAMAGE.empty())
         return true;
 
@@ -327,7 +327,7 @@ bool drawCursorBlurred(const SCursorBlurDraw& draw) {
             glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
             if (width > maxTextureSize || height > maxTextureSize) {
                 if (!sizeWarned) {
-                    Log::logger->log(Log::ERR, "[dynamic-cursors] blur fbo {}x{} exceeds GL_MAX_TEXTURE_SIZE {}, falling back to sharp cursor", width, height, maxTextureSize);
+                    LOG(Log::ERR, "[dynamic-cursors] blur fbo {}x{} exceeds GL_MAX_TEXTURE_SIZE {}, falling back to sharp cursor", width, height, maxTextureSize);
                     sizeWarned = true;
                 }
                 return false;
@@ -402,10 +402,10 @@ bool drawCursorBlurred(const SCursorBlurDraw& draw) {
     // The smear is already transformed. The native pass applies the same color
     // management as a sharp cursor, including HDR and ICC output conversion.
     blurTexture->m_imageDescription                  = draw.tex->m_imageDescription ? draw.tex->m_imageDescription : NColorManagement::getDefaultImageDescription();
-    const bool nearest                               = g_pHyprRenderer->m_renderData.useNearestNeighbor;
-    g_pHyprRenderer->m_renderData.useNearestNeighbor = draw.nearest;
-    g_pHyprRenderer->draw(CTexPassElement::SRenderData{.tex = blurTexture, .box = CBox{draw.quad.pos(), blurTexture->m_size}}, DAMAGE);
-    g_pHyprRenderer->m_renderData.useNearestNeighbor = nearest;
+    const bool nearest                               = ctx.m_data.useNearestNeighbor;
+    ctx.m_data.useNearestNeighbor                    = draw.nearest;
+    g_pHyprRenderer->draw(ctx, CTexPassElement::SRenderData{.tex = blurTexture, .box = CBox{draw.quad.pos(), blurTexture->m_size}}, DAMAGE);
+    ctx.m_data.useNearestNeighbor                    = nearest;
 
     return true;
 }

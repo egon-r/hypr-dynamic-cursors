@@ -23,5 +23,5 @@ struct SCursorBlurDraw {
  * caches the transformed average in a local texture, restores GL state, and
  * composites once through the native damage-scissored/color-managed texture path.
  */
-bool drawCursorBlurred(const SCursorBlurDraw& draw);
+bool drawCursorBlurred(Render::CRenderContext& ctx, const SCursorBlurDraw& draw);
 void destroyCursorBlurRenderer();

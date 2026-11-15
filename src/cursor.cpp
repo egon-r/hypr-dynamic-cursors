@@ -102,8 +102,8 @@ CDynamicCursors::~CDynamicCursors() {
 Reimplements rendering of the software cursor.
 Is also largely identical to hyprlands impl, but uses our custom rendering to rotate the cursor.
 */
-void CDynamicCursors::renderSoftware(Pointer::CPointerManager* pointers, PHLMONITOR pMonitor, const Time::steady_tp& now, CRegion& damage, std::optional<Vector2D> overridePos,
-                                     bool screencopy, bool forceRender) {
+void CDynamicCursors::renderSoftware(Pointer::CPointerManager* pointers, Render::CRenderContext& ctx, PHLMONITOR pMonitor, const Time::steady_tp& now, CRegion& damage,
+                                     std::optional<Vector2D> overridePos, bool screencopy, bool forceRender) {
     if (!pointers->hasCursor())
         return;
 
@@ -230,7 +230,7 @@ void CDynamicCursors::renderSoftware(Pointer::CPointerManager* pointers, PHLMONI
 
     data.box = box;
 
-    g_pHyprRenderer->m_renderPass.add(makeUnique<CCursorPassElement>(data));
+    g_pHyprRenderer->addPassElement(ctx, makeUnique<CCursorPassElement>(data));
 
     if (pointers->m_currentCursorImage.surface)
         pointers->m_currentCursorImage.surface->resource()->frame(now);
@@ -285,7 +285,7 @@ SP<Aquamarine::IBuffer> CDynamicCursors::renderHardware(Pointer::CPointerManager
 
     if (maxSize != Vector2D{-1, -1}) {
         if (targetSize.x > maxSize.x || targetSize.y > maxSize.y) {
-            Log::logger->log(Log::TRACE, "hardware cursor too big! {} > {}", pointers->m_currentCursorImage.size, maxSize);
+            LOG(Log::TRACE, "hardware cursor too big! {} > {}", pointers->m_currentCursorImage.size, maxSize);
             return nullptr;
         }
     } else {
@@ -316,7 +316,7 @@ SP<Aquamarine::IBuffer> CDynamicCursors::renderHardware(Pointer::CPointerManager
         // but if it's set, we don't wanna change it.
 
         if (!state->monitor->m_cursorSwapchain->reconfigure(options)) {
-            Log::logger->log(Log::TRACE, "Failed to reconfigure cursor swapchain");
+            LOG(Log::TRACE, "Failed to reconfigure cursor swapchain");
             return nullptr;
         }
     }
@@ -333,38 +333,45 @@ SP<Aquamarine::IBuffer> CDynamicCursors::renderHardware(Pointer::CPointerManager
 
     auto buf = state->monitor->m_cursorSwapchain->next(nullptr);
     if (!buf) {
-        Log::logger->log(Log::TRACE, "Failed to acquire a buffer from the cursor swapchain");
+        LOG(Log::TRACE, "Failed to acquire a buffer from the cursor swapchain");
         return nullptr;
     }
 
-    CRegion damage = {0, 0, INT16_MAX, INT16_MAX};
-
-    g_pHyprRenderer->m_renderData.pMonitor = state->monitor;
-    auto RBO                               = g_pHyprRenderer->getOrCreateRenderbuffer(buf, state->monitor->m_cursorSwapchain->currentOptions().format);
+    auto RBO = g_pHyprRenderer->getOrCreateRenderbuffer(buf, state->monitor->m_cursorSwapchain->currentOptions().format);
 
     // we just fail if we cannot create a render buffer, this will force hl to render software cursors, which we support
     if (!RBO)
         return nullptr;
 
-    RBO->bind();
-
     CRegion damageRegion = {0, 0, INT_MAX, INT_MAX};
-    g_pHyprRenderer->beginFullFakeRender(state->monitor.lock(), damageRegion, RBO->getFB());
-    g_pHyprRenderer->startRenderPass();
+    if (!g_pHyprRenderer->beginFullFakeRender(state->monitor.lock(), damageRegion, RBO->getFB()))
+        return nullptr;
+
+    bool                      finishing = false;
+    const Render::CScopeGuard cleanup([&] {
+        if (!finishing)
+            g_pHyprRenderer->abortRender();
+    });
+    auto& ctx = g_pHyprRenderer->context();
+
+    ctx.m_data.fbSize = RBO->getFB()->m_size;
+    g_pHyprRenderer->setProjectionType(ctx, Render::RPT_FB);
+    ctx.m_data.transformDamage = true;
+    g_pHyprRenderer->startRenderPass(ctx);
 
     if (CONFIG(hwDebug))
-        g_pHyprRenderer->draw(CClearPassElement::SClearData{CHyprColor{rand() / float(RAND_MAX), rand() / float(RAND_MAX), rand() / float(RAND_MAX), 1.F}});
+        g_pHyprRenderer->draw(ctx, CClearPassElement::SClearData{CHyprColor{rand() / float(RAND_MAX), rand() / float(RAND_MAX), rand() / float(RAND_MAX), 1.F}});
     else
-        g_pHyprRenderer->draw(CClearPassElement::SClearData{{0.F, 0.F, 0.F, 0.F}});
+        g_pHyprRenderer->draw(ctx, CClearPassElement::SClearData{{0.F, 0.F, 0.F, 0.F}});
 
     CBox   xbox      = {cursorPadding, Vector2D{Pointer::mgr()->m_currentCursorImage.size / Pointer::mgr()->m_currentCursorImage.scale * state->monitor->m_scale * zoom}.round()};
     Mat3x3 transform = toTransform(xbox, resultShown.rotation, Pointer::mgr()->m_currentCursorImage.hotspot * state->monitor->m_scale * zoom, resultShown.stretch.angle,
                                    resultShown.stretch.magnitude);
 
-    drawCursor(transform, texture, xbox, damageRegion, zoom > 1 && CONFIG(highresNearest));
+    drawCursor(ctx, transform, texture, xbox, damageRegion, zoom > 1 && CONFIG(highresNearest));
 
+    finishing = true;
     g_pHyprRenderer->endRender();
-    g_pHyprRenderer->m_renderData.pMonitor.reset();
 
     return buf;
 }
@@ -389,7 +396,7 @@ bool CDynamicCursors::setHardware(Pointer::CPointerManager* pointers, SP<Pointer
                                         state->monitor->m_cursorSwapchain->currentOptions().size.x, state->monitor->m_cursorSwapchain->currentOptions().size.y)
                              .pos();
 
-    Log::logger->log(Log::TRACE, "[pointer] hw transformed hotspot for {}: {}", state->monitor->m_name, HOTSPOT);
+    LOG(Log::TRACE, "[pointer] hw transformed hotspot for {}: {}", state->monitor->m_name, HOTSPOT);
 
     if (!state->monitor->m_output->setCursor(buf, HOTSPOT))
         return false;
@@ -431,11 +438,11 @@ void CDynamicCursors::onCursorMoved(Pointer::CPointerManager* pointers) {
         auto CROSSES = !m->logicalBox().intersection(CURSORBOX).empty();
 
         if (!CROSSES && state->cursorFrontBuffer) {
-            Log::logger->log(Log::TRACE, "onCursorMoved for output {}: cursor left the viewport, removing it from the backend", m->m_name);
+            LOG(Log::TRACE, "onCursorMoved for output {}: cursor left the viewport, removing it from the backend", m->m_name);
             pointers->setHWCursorBuffer(state, nullptr);
             continue;
         } else if (CROSSES && !state->cursorFrontBuffer) {
-            Log::logger->log(Log::TRACE, "onCursorMoved for output {}: cursor entered the output, but no front buffer, forcing recalc", m->m_name);
+            LOG(Log::TRACE, "onCursorMoved for output {}: cursor entered the output, but no front buffer, forcing recalc", m->m_name);
             recalc = true;
         }
 
@@ -563,7 +570,7 @@ void CDynamicCursors::calculate(EModeUpdate type) {
         // there should always be one monitor entered
         // this fixes an issue where the cursor shape would not properly update after change
         if (!entered) {
-            Log::logger->log(Log::INFO, "[dynamic-cursors] updating because none entered");
+            LOG(Log::INFO, "[dynamic-cursors] updating because none entered");
             Pointer::mgr()->recheckEnteredOutputs();
             Pointer::mgr()->updateCursorBackend();
         }

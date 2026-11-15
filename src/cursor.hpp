@@ -35,8 +35,8 @@ class CDynamicCursors {
     void onTick(Pointer::CPointerManager* pointers);
 
     /* hook on renderSoftwareCursorsFor */
-    void renderSoftware(Pointer::CPointerManager* pointers, PHLMONITOR pMonitor, const Time::steady_tp& now, CRegion& damage, std::optional<Vector2D> overridePos, bool screencopy,
-                        bool forceRender);
+    void renderSoftware(Pointer::CPointerManager* pointers, Render::CRenderContext& ctx, PHLMONITOR pMonitor, const Time::steady_tp& now, CRegion& damage,
+                        std::optional<Vector2D> overridePos, bool screencopy, bool forceRender);
     /* hook on damageIfSoftware*/
     void damageSoftware(Pointer::CPointerManager* pointers);
     /* hook on renderHWCursorBuffer */
