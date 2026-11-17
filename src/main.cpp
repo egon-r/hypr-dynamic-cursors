@@ -189,7 +189,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         // clang-format off
         g_pRenderSoftwareCursorsForHook = hook(
             pmf_address(&Pointer::CPointerManager::renderSoftwareCursorsFor),
-            "_ZN7Pointer15CPointerManager24renderSoftwareCursorsForEN9Hyprutils6Memory14CSharedPointerIN7Monitor8CMonitorEEERKNSt6chrono10time_pointINS7_3_V212steady_clockENS7_8durationIlSt5ratioILl1ELl1000000000EEEEEERNS1_4Math7CRegionESt8optionalINSI_8Vector2DEEbb",
+"_ZN7Pointer15CPointerManager24renderSoftwareCursorsForERN6Render14CRenderContextEN9Hyprutils6Memory14CSharedPointerIN7Monitor8CMonitorEEERKNSt6chrono10time_pointINSA_3_V212steady_clockENSA_8durationIlSt5ratioILl1ELl1000000000EEEEEERNS4_4Math7CRegionESt8optionalINSL_8Vector2DEEbb",
             (void*) &hkRenderSoftwareCursorsFor
         );
         g_pDamageIfSoftwareHook = hook(
@@ -237,7 +237,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     } catch (std::exception& e) {
         LOG(Log::ERR, "[dynamic-cursors] failed to hook, {}", e.what());
         HyprlandAPI::addNotification(PHANDLE, std::format("[dynamic-cursors] cannot load, {}", e.what()), CHyprColor{1.0, 0.2, 0.2, 1.0}, 5000);
-        throw e;
+throw;
     } catch (...) {
         LOG(Log::ERR, "[dynamic-cursors] failed to hook for unknown reason");
         HyprlandAPI::addNotification(PHANDLE, "[dynamic-cursors] cannot load, unknown error with hooks!", CHyprColor{1.0, 0.2, 0.2, 1.0}, 5000);
